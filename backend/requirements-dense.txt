@@ -1,0 +1,4 @@
+# Optional: dense point clouds via monocular depth (Depth-Anything-V2-Small, ~100 MB download on first run)
+-r requirements.txt
+torch>=2.4
+transformers>=4.45
