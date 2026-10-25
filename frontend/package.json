@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@sparkjsdev/spark": "^2.3.1",
     "three": "^0.186.1",
     "vue": "^3.5.44"
   },
