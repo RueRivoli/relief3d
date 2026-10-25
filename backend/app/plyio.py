@@ -1,4 +1,4 @@
-"""Minimal binary PLY writer for colored point clouds."""
+"""Minimal binary PLY helpers for colored point clouds."""
 
 from pathlib import Path
 
@@ -25,3 +25,13 @@ def write_ply(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
     with open(path, "wb") as f:
         f.write(header.encode("ascii"))
         f.write(vertex.tobytes())
+
+
+def ply_vertex_count(path: Path) -> int:
+    with open(path, "rb") as f:
+        for line in f:
+            if line.startswith(b"element vertex"):
+                return int(line.split()[-1])
+            if line.startswith(b"end_header"):
+                break
+    return 0

@@ -16,7 +16,7 @@ from . import pipeline
 
 log = logging.getLogger(__name__)
 
-STAGES = ["queued", "prepare", "features", "matching", "mapping", "dense", "export", "done"]
+STAGES = ["queued", "prepare", "features", "matching", "mapping", "dense", "splat", "export", "done"]
 
 
 @dataclass
@@ -26,6 +26,7 @@ class Job:
     created: float
     num_images: int
     dense: bool
+    splat: bool = False
     status: str = "queued"  # queued | running | done | error
     stage: str = "queued"
     progress: float = 0.0  # stage-local fraction
@@ -65,9 +66,9 @@ class JobManager:
     def job_dir(self, job_id: str) -> Path:
         return self.root / job_id
 
-    def create(self, name: str, uploads: list[tuple[str, bytes]], dense: bool) -> Job:
+    def create(self, name: str, uploads: list[tuple[str, bytes]], dense: bool, splat: bool) -> Job:
         job = Job(id=uuid.uuid4().hex[:12], name=name, created=time.time(),
-                  num_images=len(uploads), dense=dense)
+                  num_images=len(uploads), dense=dense, splat=splat)
         upload_dir = self.job_dir(job.id) / "uploads"
         upload_dir.mkdir(parents=True)
         for i, (filename, data) in enumerate(uploads):
@@ -106,11 +107,12 @@ class JobManager:
         self._update(job, status="running", message="Starting")
         try:
             uploads = sorted((job_dir / "uploads").iterdir())
-            scene = pipeline.reconstruct(uploads, job_dir, pipeline.Options(dense=job.dense), progress)
+            scene = pipeline.reconstruct(uploads, job_dir, pipeline.Options(dense=job.dense, splat=job.splat), progress)
             self._update(job, status="done", stage="done", progress=1.0, message="Reconstruction complete",
                          stats=scene["stats"], finished=time.time())
             # Intermediate COLMAP data is large and no longer needed.
             shutil.rmtree(job_dir / "work" / "dense_views", ignore_errors=True)
+            shutil.rmtree(job_dir / "work" / "splat", ignore_errors=True)
             shutil.rmtree(job_dir / "uploads", ignore_errors=True)
         except pipeline.PipelineError as exc:
             self._update(job, status="error", error=str(exc), finished=time.time())

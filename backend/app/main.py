@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import densify
+from . import splat as splat_mod
 from .jobs import STAGES, JobManager
 from .pipeline import IMAGE_EXTS
 
@@ -32,7 +33,7 @@ app.add_middleware(
 )
 jobs = JobManager(DATA_DIR)
 
-OUTPUT_FILES = {"scene.json", "sparse.ply", "dense.ply"}
+OUTPUT_FILES = {"scene.json", "sparse.ply", "dense.ply", "splat.ply"}
 
 
 def _get_job(job_id: str):
@@ -44,7 +45,7 @@ def _get_job(job_id: str):
 
 @app.get("/api/capabilities")
 def capabilities():
-    return {"dense": densify.is_available(), "max_images": MAX_IMAGES, "stages": STAGES}
+    return {"dense": densify.is_available(), "splat": splat_mod.is_available(), "max_images": MAX_IMAGES, "stages": STAGES}
 
 
 @app.get("/api/jobs")
@@ -57,6 +58,7 @@ async def create_job(
     files: list[UploadFile] = File(...),
     name: str = Form(""),
     dense: bool = Form(True),
+    splat: bool = Form(False),
 ):
     images = [f for f in files if Path(f.filename or "").suffix.lower() in IMAGE_EXTS]
     if len(images) < 3:
@@ -70,7 +72,7 @@ async def create_job(
             raise HTTPException(413, f"{f.filename} is larger than {MAX_UPLOAD_BYTES // 2**20} MB")
         uploads.append((f.filename or "image.jpg", data))
     job = jobs.create(name.strip() or f"Scene ({len(uploads)} photos)", uploads,
-                      dense=dense and densify.is_available())
+                      dense=dense and densify.is_available(), splat=splat and splat_mod.is_available())
     return asdict(job)
 
 
