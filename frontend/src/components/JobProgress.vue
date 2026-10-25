@@ -11,10 +11,11 @@ const STEPS = [
   { key: 'matching', label: 'Matching photos' },
   { key: 'mapping', label: 'Recovering cameras & structure' },
   { key: 'dense', label: 'Dense depth reconstruction' },
+  { key: 'splat', label: 'Training Gaussian splats' },
   { key: 'export', label: 'Exporting scene' },
 ]
 
-const steps = computed(() => STEPS.filter((s) => s.key !== 'dense' || props.job.dense))
+const steps = computed(() => STEPS.filter((s) => (s.key !== 'dense' || props.job.dense) && (s.key !== 'splat' || props.job.splat)))
 const currentIndex = computed(() => steps.value.findIndex((s) => s.key === props.job.stage))
 
 function state(i) {

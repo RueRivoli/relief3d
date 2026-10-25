@@ -12,7 +12,8 @@ const container = ref(null)
 const scene = ref(null)
 const loading = ref(true)
 const loadError = ref('')
-const cloudKind = ref('dense')
+const view = ref('dense') // 'splat' | 'dense' | 'sparse'
+const splatLoading = ref(false)
 const pointSize = ref(1)
 const showCameras = ref(true)
 const showBox = ref(false)
@@ -31,12 +32,16 @@ function readScale() {
     return null
   }
 }
+
 function writeScale(v) {
   try {
     if (v == null) localStorage.removeItem(scaleKey)
     else localStorage.setItem(scaleKey, String(v))
   } catch { /* storage unavailable */ }
 }
+
+// Measuring always picks on a point cloud, hidden behind the splats in splat view.
+const cloudKind = computed(() => (view.value === 'splat' ? (scene.value.files.dense ? 'dense' : 'sparse') : view.value))
 
 const unit = computed(() => (scale.value ? 'm' : 'units'))
 function fmt(raw) {
@@ -52,6 +57,9 @@ const dimensions = computed(() => {
 let renderer, labelRenderer, camera, controls, threeScene, resizeObserver
 let cloud = null
 const clouds = {}
+let spark = null
+let splatMesh = null
+let splatReady = null
 let cameraGroup, boxHelper, measureGroup, pendingMarker
 const cameraTargets = []
 const raycaster = new THREE.Raycaster()
@@ -150,6 +158,35 @@ async function loadCloud(kind) {
   cloud = clouds[kind]
   threeScene.add(cloud)
   updatePointSize()
+}
+
+function loadSplat() {
+  splatReady ??= createSplat()
+  return splatReady
+}
+
+async function createSplat() {
+  splatLoading.value = true
+  try {
+    const { SparkRenderer, SplatMesh } = await import('@sparkjsdev/spark') // large, load on demand
+    spark = new SparkRenderer({ renderer })
+    threeScene.add(spark)
+    splatMesh = new SplatMesh({ url: api.outputUrl(props.job.id, scene.value.files.splat) })
+    // Splats are trained in COLMAP coordinates; move them into the viewer frame.
+    splatMesh.matrixAutoUpdate = false
+    splatMesh.matrix.set(...scene.value.splat_transform.flat())
+    threeScene.add(splatMesh)
+    await splatMesh.initialized
+  } finally {
+    splatLoading.value = false
+  }
+}
+
+async function showView(kind) {
+  if (kind === 'splat') await loadSplat()
+  await loadCloud(cloudKind.value)
+  cloud.visible = kind !== 'splat'
+  if (splatMesh) splatMesh.visible = kind === 'splat'
 }
 
 function updatePointSize() {
@@ -334,7 +371,7 @@ function removeMeasurement(id) {
 watch(measurements, rebuildMeasurements, { deep: true })
 watch(scale, rebuildMeasurements)
 watch(pointSize, updatePointSize)
-watch(cloudKind, (k) => scene.value && loadCloud(k))
+watch(view, (k) => scene.value && !loading.value && showView(k).catch((e) => (loadError.value = e.message)))
 watch(showCameras, (v) => {
   cameraGroup.visible = v
   if (!v) selectedCamera.value = null
@@ -346,8 +383,8 @@ onMounted(async () => {
   try {
     scene.value = await api.scene(props.job.id)
     sceneScale = Math.hypot(...scene.value.bounds.size) || 1
-    cloudKind.value = scene.value.files.dense ? 'dense' : 'sparse'
-    await loadCloud(cloudKind.value)
+    view.value = scene.value.files.splat ? 'splat' : scene.value.files.dense ? 'dense' : 'sparse'
+    await showView(view.value)
     buildCameras()
     buildBox()
     resetView(false)
@@ -370,6 +407,7 @@ onUnmounted(() => {
     c.geometry.dispose()
     c.material.dispose()
   })
+  splatMesh?.dispose()
   renderer.dispose()
 })
 </script>
@@ -379,6 +417,7 @@ onUnmounted(() => {
     <div ref="container" class="canvas" :class="{ measuring }" />
 
     <div v-if="loading" class="overlay">Loading 3D scene…</div>
+    <div v-else-if="splatLoading" class="overlay">Loading Gaussian splats…</div>
     <div v-else-if="loadError" class="overlay error">{{ loadError }}</div>
 
     <template v-if="scene">
@@ -386,7 +425,8 @@ onUnmounted(() => {
         <div class="title">{{ job.name }}</div>
         <div class="muted small">
           {{ scene.stats.images_registered }}/{{ scene.stats.images_uploaded }} photos placed ·
-          {{ (scene.stats.dense_points || scene.stats.sparse_points).toLocaleString() }} points
+          <template v-if="view === 'splat'">{{ scene.stats.splats.toLocaleString() }} splats</template>
+          <template v-else>{{ (scene.stats.dense_points || scene.stats.sparse_points).toLocaleString() }} points</template>
         </div>
         <div v-if="dimensions" class="dims">
           <div><span class="muted">Width</span>{{ dimensions.width }}</div>
@@ -406,11 +446,12 @@ onUnmounted(() => {
       </div>
 
       <div class="panel toolbar">
-        <div v-if="scene.files.dense" class="seg">
-          <button :class="{ active: cloudKind === 'dense' }" @click="cloudKind = 'dense'">Dense</button>
-          <button :class="{ active: cloudKind === 'sparse' }" @click="cloudKind = 'sparse'">Sparse</button>
+        <div v-if="scene.files.dense || scene.files.splat" class="seg">
+          <button v-if="scene.files.splat" :class="{ active: view === 'splat' }" @click="view = 'splat'">Splats</button>
+          <button v-if="scene.files.dense" :class="{ active: view === 'dense' }" @click="view = 'dense'">Dense</button>
+          <button :class="{ active: view === 'sparse' }" @click="view = 'sparse'">Sparse</button>
         </div>
-        <label class="size">
+        <label v-if="view !== 'splat'" class="size">
           <span class="muted small">Point size</span>
           <input v-model.number="pointSize" type="range" min="0.3" max="4" step="0.1" />
         </label>
@@ -419,7 +460,7 @@ onUnmounted(() => {
         <button :class="{ active: measuring }" @click="toggleMeasuring">📏 Measure</button>
         <button @click="resetView()">Reset view</button>
         <button @click="topView">Top view</button>
-        <a :href="api.outputUrl(job.id, scene.files[cloudKind])" :download="`${job.name}-${cloudKind}.ply`">
+        <a :href="api.outputUrl(job.id, scene.files[view])" :download="`${job.name}-${view}.ply`">
           <button>Download .ply</button>
         </a>
       </div>
@@ -482,8 +523,9 @@ onUnmounted(() => {
   padding: 8px; max-width: calc(100% - 32px);
 }
 .seg { display: flex; }
-.seg button:first-child { border-radius: 8px 0 0 8px; }
-.seg button:last-child { border-radius: 0 8px 8px 0; margin-left: -1px; }
+.seg button { border-radius: 0; margin-left: -1px; }
+.seg button:first-child { border-radius: 8px 0 0 8px; margin-left: 0; }
+.seg button:last-child { border-radius: 0 8px 8px 0; }
 .size { display: flex; align-items: center; gap: 6px; }
 .size input { width: 90px; accent-color: var(--accent); }
 .status { top: 16px; left: 50%; transform: translateX(-50%); padding: 8px 14px; }

@@ -9,6 +9,7 @@ const ACCEPT = /\.(jpe?g|png|webp|heic|bmp|tiff?)$/i
 const files = ref([]) // { file, url }
 const name = ref('')
 const dense = ref(true)
+const splat = ref(false)
 const dragging = ref(false)
 const uploading = ref(false)
 const uploadProgress = ref(0)
@@ -52,7 +53,7 @@ async function submit() {
   try {
     const job = await api.createJob(
       files.value.map((f) => f.file),
-      { name: name.value, dense: dense.value && props.capabilities.dense },
+      { name: name.value, dense: dense.value && props.capabilities.dense, splat: splat.value && props.capabilities.splat },
       (p) => (uploadProgress.value = p),
     )
     clearAll()
@@ -106,6 +107,10 @@ onUnmounted(clearAll)
       <label class="check" :class="{ disabled: !capabilities.dense }" :title="capabilities.dense ? '' : 'Install backend/requirements-dense.txt to enable'">
         <input v-model="dense" type="checkbox" :disabled="!capabilities.dense" />
         Dense reconstruction <span class="muted">(AI depth, slower but much fuller)</span>
+      </label>
+      <label class="check" :class="{ disabled: !capabilities.splat }" :title="capabilities.splat ? '' : 'Run scripts/install-brush.sh to enable'">
+        <input v-model="splat" type="checkbox" :disabled="!capabilities.splat" />
+        Gaussian splatting <span class="muted">(photorealistic rendering, ~15–30 min on a laptop GPU)</span>
       </label>
       <div class="actions">
         <span class="muted">{{ files.length }} photo{{ files.length === 1 ? '' : 's' }}</span>

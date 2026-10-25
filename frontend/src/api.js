@@ -20,12 +20,13 @@ export const api = {
   imageUrl: (id, name) => `/api/jobs/${id}/images/${encodeURIComponent(name)}`,
 
   // XHR instead of fetch to report upload progress.
-  createJob(files, { name, dense }, onProgress) {
+  createJob(files, { name, dense, splat }, onProgress) {
     return new Promise((resolve, reject) => {
       const form = new FormData()
       files.forEach((f) => form.append('files', f, f.name))
       form.append('name', name)
       form.append('dense', dense ? 'true' : 'false')
+      form.append('splat', splat ? 'true' : 'false')
       const xhr = new XMLHttpRequest()
       xhr.open('POST', '/api/jobs')
       xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total)
