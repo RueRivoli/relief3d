@@ -1,9 +1,10 @@
 """Images → 3D reconstruction pipeline.
 
-1. Normalize the uploaded images (EXIF rotation, max resolution).
+1. Extract sharp frames from uploaded videos, normalize the images (EXIF rotation, max resolution).
 2. Structure-from-Motion with COLMAP (pycolmap): camera poses + sparse points.
 3. Optional densification from monocular depth aligned to the SfM points.
-4. Re-orient the scene (Y up, floor at y=0, walls along X/Z) and export
+4. Optional 3D Gaussian Splatting trained on the undistorted SfM dataset.
+5. Re-orient the scene (Y up, floor at y=0, walls along X/Z) and export
    PLY point clouds plus a scene.json with cameras and dimensions.
 """
 
@@ -30,7 +31,9 @@ except ImportError:
     pass
 
 from . import densify as dense_mod
-from .plyio import write_ply
+from . import splat as splat_mod
+from . import video as video_mod
+from .plyio import ply_vertex_count, write_ply
 
 log = logging.getLogger(__name__)
 
@@ -46,8 +49,11 @@ class PipelineError(RuntimeError):
 @dataclass
 class Options:
     dense: bool = True
+    splat: bool = False
+    splat_steps: int = 5000
     max_image_size: int = 1600
     max_features: int = 8192
+    video_frames: int = 100  # total over all videos; exhaustive matching stays below 120 images
 
 
 def prepare_images(src_files: list[Path], dst: Path, max_size: int) -> list[str]:
@@ -69,6 +75,31 @@ def prepare_images(src_files: list[Path], dst: Path, max_size: int) -> list[str]
     return names
 
 
+def extract_video_frames(src_files: list[Path], dst: Path, opts: Options, progress: Progress) -> list[Path]:
+    """Replace each video in `src_files` by its extracted frames."""
+    videos = [p for p in src_files if p.suffix.lower() in video_mod.VIDEO_EXTS]
+    if not videos:
+        return src_files
+    if not video_mod.is_available():
+        raise PipelineError("Video input requires PyAV: pip install av")
+    shutil.rmtree(dst, ignore_errors=True)
+    files = [p for p in src_files if p not in videos]
+    for k, video in enumerate(videos):
+        def on_progress(fraction: float, k=k, video=video) -> None:
+            progress("prepare", (k + fraction) / len(videos), f"Extracting frames from {video.name}")
+
+        try:
+            frames = video_mod.extract_frames(video, dst, max(3, opts.video_frames // len(videos)),
+                                              opts.max_image_size, on_progress)
+        except video_mod.VideoError as exc:
+            log.warning("Skipping video: %s", exc)
+            continue
+        log.info("Extracted %d frames from %s", len(frames), video.name)
+        files += frames
+    return files
+
+
+# structure from Motion
 def run_sfm(image_dir: Path, work: Path, opts: Options, progress: Progress) -> pycolmap.Reconstruction:
     db = work / "database.db"
     if db.exists():
@@ -100,6 +131,7 @@ def run_sfm(image_dir: Path, work: Path, opts: Options, progress: Progress) -> p
         registered += 1
         progress("mapping", min(registered / n_images, 0.99), f"Registered {registered + 1}/{n_images} images")
 
+    # mapping of SIFT dots, 
     models = pycolmap.incremental_mapping(db, image_dir, sparse_dir, next_image_callback=on_next_image)
     if not models:
         raise PipelineError(
@@ -157,6 +189,28 @@ def run_dense(
     return data["xyz"].astype(np.float64), data["rgb"]
 
 
+def run_splat(rec: pycolmap.Reconstruction, image_dir: Path, work: Path, steps: int,
+              progress: Progress) -> Path | None:
+    """Train Gaussian splats in COLMAP world coordinates; returns the .ply path."""
+    progress("splat", 0.0, "Undistorting images for Gaussian splatting")
+    model_dir = work / "splat_model"
+    dataset = work / "splat"
+    for d in (model_dir, dataset):
+        shutil.rmtree(d, ignore_errors=True)
+    model_dir.mkdir(parents=True)
+    rec.write(model_dir)
+    # Splat rasterizers assume pinhole cameras: remove lens distortion first.
+    pycolmap.undistort_images(dataset, model_dir, image_dir)
+    out_file = work / "splat.ply"
+    progress("splat", 0.0, "Starting Gaussian splatting training")
+    ok = splat_mod.train(dataset, out_file, steps, lambda f, m: progress("splat", f, m), work / "splat.log")
+    if not ok:
+        # Like densification, splats are a bonus: keep the point clouds if training fails.
+        log.error("Gaussian splatting failed, see %s", work / "splat.log")
+        return None
+    return out_file
+
+
 def scene_transform(rec: pycolmap.Reconstruction, xyz: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
     """Similarity (R, s, t) mapping COLMAP world → viewer world (Y up, floor at 0, ~10 units wide)."""
     poses = [rec.image(i).cam_from_world() for i in rec.reg_image_ids()]
@@ -202,6 +256,7 @@ def export_scene(
     sparse: tuple[np.ndarray, np.ndarray],
     dense: tuple[np.ndarray, np.ndarray] | None,
     n_uploaded: int,
+    splat: Path | None = None,
 ) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     ref_xyz = dense[0] if dense is not None and len(dense[0]) else sparse[0]
@@ -220,6 +275,13 @@ def export_scene(
         write_ply(out / "dense.ply", dx, dense[1])
         files["dense"] = "dense.ply"
         main_xyz = dx
+    n_splats = 0
+    if splat is not None:
+        # Splats stay in COLMAP coordinates (rotating their SH coefficients is
+        # not worth it); the viewer applies `splat_transform` instead.
+        shutil.move(splat, out / "splat.ply")
+        files["splat"] = "splat.ply"
+        n_splats = ply_vertex_count(out / "splat.ply")
 
     cameras = []
     for i in rec.reg_image_ids():
@@ -241,12 +303,15 @@ def export_scene(
     scene = {
         "files": files,
         "cameras": cameras,
+        # Row-major 4x4 similarity mapping COLMAP world → viewer world.
+        "splat_transform": np.block([[s * R, t[:, None]], [np.zeros((1, 3)), np.ones((1, 1))]]).tolist(),
         "bounds": {"min": lo.tolist(), "max": hi.tolist(), "size": (hi - lo).tolist()},
         "stats": {
             "images_uploaded": n_uploaded,
             "images_registered": rec.num_reg_images(),
             "sparse_points": int(len(sx)),
             "dense_points": int(len(dense[0])) if dense is not None else 0,
+            "splats": n_splats,
             "reprojection_error": float(rec.compute_mean_reprojection_error()),
         },
         # SfM from photos alone has no absolute scale; the viewer lets users calibrate it.
@@ -262,6 +327,8 @@ def reconstruct(src_files: list[Path], job_dir: Path, opts: Options, progress: P
     out = job_dir / "output"
     work.mkdir(parents=True, exist_ok=True)
 
+    progress("prepare", 0.0, "Preparing images")
+    src_files = extract_video_frames(src_files, work / "frames", opts, progress)
     progress("prepare", 0.0, "Preparing images")
     names = prepare_images(src_files, image_dir, opts.max_image_size)
     if len(names) < 3:
@@ -281,8 +348,14 @@ def reconstruct(src_files: list[Path], job_dir: Path, opts: Options, progress: P
     elif opts.dense:
         log.warning("Dense mode requested but torch/transformers are not installed")
 
+    splat = None
+    if opts.splat and splat_mod.is_available():
+        splat = run_splat(rec, image_dir, work, opts.splat_steps, progress)
+    elif opts.splat:
+        log.warning("Gaussian splatting requested but brush_app was not found")
+
     progress("export", 0.0, "Exporting 3D scene")
-    return export_scene(rec, out, (sparse_xyz, sparse_rgb), dense, len(src_files))
+    return export_scene(rec, out, (sparse_xyz, sparse_rgb), dense, len(src_files), splat)
 
 
 if __name__ == "__main__":
@@ -290,14 +363,16 @@ if __name__ == "__main__":
     import sys
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    ap = argparse.ArgumentParser(description="Reconstruct a 3D scene from a folder of images")
+    ap = argparse.ArgumentParser(description="Reconstruct a 3D scene from a folder of images and/or videos")
     ap.add_argument("images", type=Path)
     ap.add_argument("job_dir", type=Path)
     ap.add_argument("--no-dense", action="store_true")
+    ap.add_argument("--splat", action="store_true", help="also train Gaussian splats (needs brush_app)")
+    ap.add_argument("--splat-steps", type=int, default=Options.splat_steps)
     a = ap.parse_args()
-    files = [p for p in a.images.iterdir() if p.suffix.lower() in IMAGE_EXTS]
+    files = [p for p in a.images.iterdir() if p.suffix.lower() in IMAGE_EXTS | video_mod.VIDEO_EXTS]
     result = reconstruct(
-        files, a.job_dir, Options(dense=not a.no_dense),
+        files, a.job_dir, Options(dense=not a.no_dense, splat=a.splat, splat_steps=a.splat_steps),
         lambda st, f, m: print(f"[{st} {f:4.0%}] {m}", file=sys.stderr),
     )
     print(json.dumps(result["stats"], indent=2), json.dumps(result["bounds"]))

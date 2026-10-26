@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { api } from "./api";
+import { inputSummary } from "./labels";
 import UploadPanel from "./components/UploadPanel.vue";
 import JobProgress from "./components/JobProgress.vue";
 import SceneViewer from "./components/SceneViewer.vue";
@@ -79,7 +80,7 @@ onUnmounted(() => clearTimeout(timer));
           <div class="info">
             <div class="name">{{ job.name }}</div>
             <div class="muted small">
-              {{ job.num_images }} photos · {{ formatDate(job.created) }}
+              {{ inputSummary(job) }} · {{ formatDate(job.created) }}
             </div>
           </div>
           <button

@@ -1,12 +1,14 @@
 <script setup>
 import { computed, onUnmounted, ref } from 'vue'
 import { api } from '../api'
+import { inputSummary } from '../labels'
 
 const props = defineProps({ capabilities: { type: Object, required: true } })
 const emit = defineEmits(['created'])
 
 const ACCEPT = /\.(jpe?g|png|webp|heic|bmp|tiff?)$/i
-const files = ref([]) // { file, url }
+const VIDEO = /\.(mp4|mov|m4v|webm|mkv|avi)$/i
+const files = ref([]) // { file, url, video }
 const name = ref('')
 const dense = ref(true)
 const splat = ref(false)
@@ -16,18 +18,26 @@ const uploadProgress = ref(0)
 const error = ref('')
 const input = ref(null)
 
-const canSubmit = computed(() => files.value.length >= 3 && !uploading.value)
+const numVideos = computed(() => files.value.filter((f) => f.video).length)
+const numPhotos = computed(() => files.value.length - numVideos.value)
+// A video alone is enough: frames are extracted on the server.
+const canSubmit = computed(() => (numPhotos.value >= 3 || numVideos.value > 0) && !uploading.value)
 
 function addFiles(list) {
   error.value = ''
   const known = new Set(files.value.map((f) => f.file.name + f.file.size))
   for (const file of list) {
-    if (!ACCEPT.test(file.name) || known.has(file.name + file.size)) continue
+    const video = VIDEO.test(file.name)
+    if (video && !props.capabilities.video) {
+      error.value = 'Video input is not available: install PyAV on the server (pip install av).'
+      continue
+    }
+    if (!(video || ACCEPT.test(file.name)) || known.has(file.name + file.size)) continue
     // Browsers can't preview HEIC; show a placeholder tile instead.
     const url = /\.heic$/i.test(file.name) ? null : URL.createObjectURL(file)
-    files.value.push({ file, url })
+    files.value.push({ file, url, video })
   }
-  if (files.value.length > props.capabilities.max_images) {
+  if (numPhotos.value > props.capabilities.max_images) {
     error.value = `At most ${props.capabilities.max_images} photos per scene.`
   }
 }
@@ -75,8 +85,8 @@ onUnmounted(clearAll)
     <div class="intro">
       <h1>Reconstruct a scene in 3D</h1>
       <p class="muted">
-        Upload photos of a room or a landscape taken from different positions. The app recovers where each
-        photo was taken and builds a colored 3D point cloud you can explore and measure.
+        Upload photos or a video of a room or a landscape taken from different positions. The app recovers where
+        each photo was taken and builds a colored 3D point cloud you can explore and measure.
       </p>
     </div>
 
@@ -88,16 +98,18 @@ onUnmounted(clearAll)
       @dragleave.prevent="dragging = false"
       @drop.prevent="onDrop"
     >
-      <input ref="input" type="file" multiple accept="image/*,.heic" hidden @change="addFiles($event.target.files); $event.target.value = ''" />
+      <input ref="input" type="file" multiple accept="image/*,.heic,video/*" hidden @change="addFiles($event.target.files); $event.target.value = ''" />
       <div class="icon">⬆</div>
-      <div><strong>Drop photos here</strong> or click to browse</div>
-      <div class="muted small">JPG, PNG, HEIC, WEBP · at least 3, ideally 15–60 photos</div>
+      <div><strong>Drop photos or a video here</strong> or click to browse</div>
+      <div class="muted small">JPG, PNG, HEIC, WEBP · at least 3, ideally 15–60 photos — or MP4, MOV videos</div>
     </div>
 
     <div v-if="files.length" class="thumbs">
       <div v-for="(f, i) in files" :key="f.file.name + f.file.size" class="thumb">
-        <img v-if="f.url" :src="f.url" :alt="f.file.name" loading="lazy" />
+        <video v-if="f.video && f.url" :src="f.url" muted preload="metadata" />
+        <img v-else-if="f.url" :src="f.url" :alt="f.file.name" loading="lazy" />
         <div v-else class="placeholder">{{ f.file.name.split('.').pop().toUpperCase() }}</div>
+        <span v-if="f.video" class="badge">▶ Video</span>
         <button class="remove" title="Remove" @click="removeFile(i)">✕</button>
       </div>
     </div>
@@ -113,7 +125,7 @@ onUnmounted(clearAll)
         Gaussian splatting <span class="muted">(photorealistic rendering, ~15–30 min on a laptop GPU)</span>
       </label>
       <div class="actions">
-        <span class="muted">{{ files.length }} photo{{ files.length === 1 ? '' : 's' }}</span>
+        <span class="muted">{{ inputSummary({ num_images: numPhotos, num_videos: numVideos }) }}</span>
         <button v-if="files.length" :disabled="uploading" @click="clearAll">Clear</button>
         <button class="primary" :disabled="!canSubmit" @click="submit">
           {{ uploading ? `Uploading ${Math.round(uploadProgress * 100)}%` : 'Build 3D scene' }}
@@ -129,6 +141,7 @@ onUnmounted(clearAll)
         <li>For a room: walk along the walls, pointing the camera toward the opposite side, and include the corners.</li>
         <li>Keep the scene static, well lit and sharp (avoid motion blur). Textured surfaces work best; plain white walls and mirrors are hard.</li>
         <li>Use the same camera and zoom for all photos.</li>
+        <li>Video: walk slowly and steadily, 20 s to 2 min, no fast pans. About 100 sharp frames are picked automatically.</li>
       </ul>
     </details>
   </div>
@@ -155,7 +168,8 @@ h1 { margin: 0 0 6px; font-size: 24px; }
 .small { font-size: 12px; }
 .thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; }
 .thumb { position: relative; aspect-ratio: 1; border-radius: 8px; overflow: hidden; background: var(--panel-2); }
-.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb img, .thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.badge { position: absolute; left: 4px; bottom: 4px; padding: 1px 6px; border-radius: 4px; font-size: 11px; background: rgba(0, 0, 0, 0.6); color: #fff; }
 .placeholder { display: grid; place-items: center; height: 100%; color: var(--muted); font-size: 12px; }
 .remove { position: absolute; top: 4px; right: 4px; padding: 1px 6px; font-size: 11px; background: rgba(0, 0, 0, 0.6); opacity: 0; }
 .thumb:hover .remove { opacity: 1; }

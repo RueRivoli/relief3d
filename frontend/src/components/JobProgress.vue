@@ -1,5 +1,6 @@
 <script setup>
 import { computed } from 'vue'
+import { inputSummary } from '../labels'
 
 const props = defineProps({
   job: { type: Object, required: true },
@@ -32,7 +33,7 @@ function state(i) {
 <template>
   <div class="progress">
     <h2>{{ job.name }}</h2>
-    <p class="muted">{{ job.num_images }} photos</p>
+    <p class="muted">{{ inputSummary(job) }}</p>
 
     <div v-if="job.status === 'error'" class="error-box">
       <strong>Reconstruction failed</strong>

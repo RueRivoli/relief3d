@@ -11,6 +11,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import BinaryIO
 
 from . import pipeline
 
@@ -27,6 +28,7 @@ class Job:
     num_images: int
     dense: bool
     splat: bool = False
+    num_videos: int = 0
     status: str = "queued"  # queued | running | done | error
     stage: str = "queued"
     progress: float = 0.0  # stage-local fraction
@@ -66,14 +68,16 @@ class JobManager:
     def job_dir(self, job_id: str) -> Path:
         return self.root / job_id
 
-    def create(self, name: str, uploads: list[tuple[str, bytes]], dense: bool, splat: bool) -> Job:
+    def create(self, name: str, uploads: list[tuple[str, BinaryIO]], num_images: int, num_videos: int,
+               dense: bool, splat: bool) -> Job:
         job = Job(id=uuid.uuid4().hex[:12], name=name, created=time.time(),
-                  num_images=len(uploads), dense=dense, splat=splat)
+                  num_images=num_images, num_videos=num_videos, dense=dense, splat=splat)
         upload_dir = self.job_dir(job.id) / "uploads"
         upload_dir.mkdir(parents=True)
         for i, (filename, data) in enumerate(uploads):
             safe = Path(filename).name or f"image_{i}.jpg"
-            (upload_dir / f"{i:04d}_{safe}").write_bytes(data)
+            with open(upload_dir / f"{i:04d}_{safe}", "wb") as out:
+                shutil.copyfileobj(data, out)
         with self.lock:
             self.jobs[job.id] = job
             self._save(job)
@@ -113,6 +117,7 @@ class JobManager:
             # Intermediate COLMAP data is large and no longer needed.
             shutil.rmtree(job_dir / "work" / "dense_views", ignore_errors=True)
             shutil.rmtree(job_dir / "work" / "splat", ignore_errors=True)
+            shutil.rmtree(job_dir / "work" / "frames", ignore_errors=True)
             shutil.rmtree(job_dir / "uploads", ignore_errors=True)
         except pipeline.PipelineError as exc:
             self._update(job, status="error", error=str(exc), finished=time.time())

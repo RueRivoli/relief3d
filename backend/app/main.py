@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import densify
 from . import splat as splat_mod
+from . import video as video_mod
 from .jobs import STAGES, JobManager
 from .pipeline import IMAGE_EXTS
 
@@ -23,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT / "data" / "jobs"))
 MAX_IMAGES = 200
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024  # per image
+MAX_VIDEO_BYTES = 2 * 1024**3  # per video
 
 app = FastAPI(title="Images to 3D")
 app.add_middleware(
@@ -45,7 +47,8 @@ def _get_job(job_id: str):
 
 @app.get("/api/capabilities")
 def capabilities():
-    return {"dense": densify.is_available(), "splat": splat_mod.is_available(), "max_images": MAX_IMAGES, "stages": STAGES}
+    return {"dense": densify.is_available(), "splat": splat_mod.is_available(), "video": video_mod.is_available(),
+            "max_images": MAX_IMAGES, "stages": STAGES}
 
 
 @app.get("/api/jobs")
@@ -54,24 +57,33 @@ def list_jobs():
 
 
 @app.post("/api/jobs", status_code=201)
-async def create_job(
+def create_job(  # sync: FastAPI runs it in a thread, so copying large videos does not block the event loop
     files: list[UploadFile] = File(...),
     name: str = Form(""),
     dense: bool = Form(True),
     splat: bool = Form(False),
 ):
-    images = [f for f in files if Path(f.filename or "").suffix.lower() in IMAGE_EXTS]
-    if len(images) < 3:
-        raise HTTPException(400, "Upload at least 3 images (JPG, PNG, HEIC, WEBP…).")
-    if len(images) > MAX_IMAGES:
+    def ext(f: UploadFile) -> str:
+        return Path(f.filename or "").suffix.lower()
+
+    accepted = [f for f in files if ext(f) in IMAGE_EXTS | video_mod.VIDEO_EXTS]
+    n_videos = sum(ext(f) in video_mod.VIDEO_EXTS for f in accepted)
+    n_images = len(accepted) - n_videos
+    if n_videos and not video_mod.is_available():
+        raise HTTPException(400, "Video input requires PyAV on the server (pip install av).")
+    if not n_videos and n_images < 3:
+        raise HTTPException(400, "Upload at least 3 images (JPG, PNG, HEIC, WEBP…) or a video (MP4, MOV…).")
+    if n_images > MAX_IMAGES:
         raise HTTPException(400, f"At most {MAX_IMAGES} images per scene.")
-    uploads = []
-    for f in images:
-        data = await f.read()
-        if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(413, f"{f.filename} is larger than {MAX_UPLOAD_BYTES // 2**20} MB")
-        uploads.append((f.filename or "image.jpg", data))
-    job = jobs.create(name.strip() or f"Scene ({len(uploads)} photos)", uploads,
+    for f in accepted:
+        limit = MAX_VIDEO_BYTES if ext(f) in video_mod.VIDEO_EXTS else MAX_UPLOAD_BYTES
+        f.file.seek(0, os.SEEK_END)
+        if f.file.tell() > limit:
+            raise HTTPException(413, f"{f.filename} is larger than {limit // 2**20} MB")
+        f.file.seek(0)
+    parts = [f"{n} {kind}{'s' if n > 1 else ''}" for n, kind in ((n_images, "photo"), (n_videos, "video")) if n]
+    job = jobs.create(name.strip() or f"Scene ({', '.join(parts)})", [(f.filename or "upload", f.file) for f in accepted],
+                      num_images=n_images, num_videos=n_videos,
                       dense=dense and densify.is_available(), splat=splat and splat_mod.is_available())
     return asdict(job)
 
